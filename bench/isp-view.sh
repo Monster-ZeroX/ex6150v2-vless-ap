@@ -10,7 +10,36 @@ network_get_ipaddr WANIP wan
 ME=${SSH_CLIENT%% *}                      # leave your own SSH session out of the capture
 REAL=$(sed -n 's#^vless://[^@]*@\([^:/?]*\).*#\1#p' /etc/sing-box/link.txt)
 P=/tmp/isp.pcap
-tcpdump -i $WAN -nn -s 800 -w $P "not arp${ME:+ and not host $ME}" 2>/dev/null &
+# reads the server_name extension of each TLS ClientHello from a `tcpdump -x` hex dump
+SNI_AWK='
+# Parse TLS ClientHellos from `tcpdump -x` hex dumps and print the server_name of each.
+function flush(   n, ihl, thl, o, p, sid, cl, el, end, t, l, nl, s, i) {
+	n = nb
+	if (n < 60) return
+	ihl = (b[0] % 16) * 4; thl = int(b[ihl + 12] / 16) * 4; o = ihl + thl
+	if (b[o] != 22 || b[o + 5] != 1) return
+	p = o + 5 + 4 + 2 + 32
+	sid = b[p]; p += 1 + sid
+	cl = b[p] * 256 + b[p + 1]; p += 2 + cl
+	p += 1 + b[p]
+	el = b[p] * 256 + b[p + 1]; p += 2; end = p + el
+	while (p + 4 <= end && p + 4 <= n) {
+		t = b[p] * 256 + b[p + 1]; l = b[p + 2] * 256 + b[p + 3]; p += 4
+		if (t == 0) {
+			nl = b[p + 3] * 256 + b[p + 4]; s = ""
+			for (i = p + 5; i < p + 5 + nl && i < n; i++) s = s sprintf("%c", b[i])
+			print s; return
+		}
+		p += l
+	}
+	print "(no SNI)"
+}
+BEGIN { for (i = 0; i < 256; i++) hex[sprintf("%02x", i)] = i }
+/^[^ \t]/ { flush(); nb = 0; next }
+/^\t0x/ { for (i = 2; i <= NF; i++) { w = $i; while (length(w) >= 2) { b[nb++] = hex[substr(w, 1, 2)]; w = substr(w, 3) } } }
+END { flush() }
+'
+tcpdump -i $WAN -nn -s 1600 -w $P "not arp${ME:+ and not host $ME}" 2>/dev/null &
 TD=$!
 sleep 2
 /etc/init.d/sing-box restart            # a reconnect, as at boot or after Save & Connect
@@ -27,8 +56,8 @@ sleep 2; kill $TD; wait $TD 2>/dev/null
 echo "packets captured: $(tcpdump -nn -r $P 2>/dev/null | wc -l)"
 echo "plaintext DNS questions (should be none):"
 tcpdump -nn -r $P 'port 53' 2>/dev/null | grep -oE '(A|AAAA|HTTPS|PTR)\? [^ ]+' | sort | uniq -c | sed 's/^/  /'
-echo "TLS SNIs in clear (should only be your SNI):"
-tcpdump -nn -r $P -A 'tcp[((tcp[12] & 0xf0) >> 2)] = 0x16 and tcp[((tcp[12] & 0xf0) >> 2) + 5] = 1' 2>/dev/null | grep -aoE '([a-z0-9][a-z0-9-]+\.)+[a-z]{2,10}' | sort | uniq -c | sed 's/^/  /'
+echo "TLS SNIs in clear (should only be your SNI; \"(no SNI)\" = the DoH lookup to 1.1.1.1):"
+tcpdump -nn -r $P -x 'tcp[((tcp[12] & 0xf0) >> 2)] = 0x16 and tcp[((tcp[12] & 0xf0) >> 2) + 5] = 1' 2>/dev/null | awk "$SNI_AWK" | sort | uniq -c | sed 's/^/  /'
 echo "plain HTTP Host headers (should be none):"
 tcpdump -nn -r $P -A 'tcp dst port 80' 2>/dev/null | grep -aoE 'Host: [^ ]+' | sort | uniq -c | sed 's/^/  /'
 [ -n "$REAL" ] && echo "real server name '$REAL' seen in clear: $(tcpdump -nn -r $P -A 2>/dev/null | grep -acF "$REAL") packets (should be 0)"
