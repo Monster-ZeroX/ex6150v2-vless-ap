@@ -28,7 +28,7 @@ echo "packets captured: $(tcpdump -nn -r $P 2>/dev/null | wc -l)"
 echo "plaintext DNS questions (should be none):"
 tcpdump -nn -r $P 'port 53' 2>/dev/null | grep -oE '(A|AAAA|HTTPS|PTR)\? [^ ]+' | sort | uniq -c | sed 's/^/  /'
 echo "TLS SNIs in clear (should only be your SNI):"
-tcpdump -nn -r $P -A 'tcp[((tcp[12] & 0xf0) >> 2)] = 0x16 and tcp[((tcp[12] & 0xf0) >> 2) + 5] = 1' 2>/dev/null | grep -aoE '[a-z0-9][a-z0-9.-]{2,}\.[a-z]{2,}' | sort | uniq -c | sed 's/^/  /'
+tcpdump -nn -r $P -A 'tcp[((tcp[12] & 0xf0) >> 2)] = 0x16 and tcp[((tcp[12] & 0xf0) >> 2) + 5] = 1' 2>/dev/null | grep -aoE '([a-z0-9][a-z0-9-]+\.)+[a-z]{2,10}' | sort | uniq -c | sed 's/^/  /'
 echo "plain HTTP Host headers (should be none):"
 tcpdump -nn -r $P -A 'tcp dst port 80' 2>/dev/null | grep -aoE 'Host: [^ ]+' | sort | uniq -c | sed 's/^/  /'
 [ -n "$REAL" ] && echo "real server name '$REAL' seen in clear: $(tcpdump -nn -r $P -A 2>/dev/null | grep -acF "$REAL") packets (should be 0)"
