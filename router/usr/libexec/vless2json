@@ -1,0 +1,174 @@
+#!/usr/bin/awk -f
+# Convert a vless:// share link (read from a file or stdin) into a full sing-box config.json on stdout.
+# Supports security=none|tls|reality and type=tcp|ws|httpupgrade|grpc|http|h2.
+
+function fail(msg) { print "error: " msg > "/dev/stderr"; failed = 1; exit 1 }
+
+function hexval(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+
+function urldecode(s,    out, i, c, h, l) {
+	out = ""
+	for (i = 1; i <= length(s); i++) {
+		c = substr(s, i, 1)
+		if (c == "%" && i + 2 <= length(s)) {
+			h = hexval(substr(s, i + 1, 1)); l = hexval(substr(s, i + 2, 1))
+			if (h >= 0 && l >= 0 && h * 16 + l >= 32) { out = out sprintf("%c", h * 16 + l); i += 2; continue }
+		}
+		out = out c
+	}
+	return out
+}
+
+function js(s) {
+	gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/[[:cntrl:]]/, "", s)
+	return "\"" s "\""
+}
+
+function strlist(s,    n, a, i, out) {
+	n = split(s, a, ",")
+	out = ""
+	for (i = 1; i <= n; i++) if (a[i] != "") out = out (out == "" ? "" : ", ") js(a[i])
+	return "[" out "]"
+}
+
+{ link = link $0 }
+
+END {
+	if (failed) exit 1
+	gsub(/[[:space:]]/, "", link)
+	if (tolower(substr(link, 1, 8)) != "vless://") fail("link must start with vless://")
+	rest = substr(link, 9)
+
+	name = ""; p = index(rest, "#")
+	if (p) { name = urldecode(substr(rest, p + 1)); rest = substr(rest, 1, p - 1) }
+	query = ""; p = index(rest, "?")
+	if (p) { query = substr(rest, p + 1); rest = substr(rest, 1, p - 1) }
+	sub(/\/$/, "", rest)
+
+	p = index(rest, "@")
+	if (!p) fail("missing uuid@server:port")
+	uuid = urldecode(substr(rest, 1, p - 1)); hp = substr(rest, p + 1)
+	if (substr(hp, 1, 1) == "[") {
+		p = index(hp, "]"); server = substr(hp, 2, p - 2); port = substr(hp, p + 2)
+	} else {
+		p = match(hp, /:[0-9]+$/)
+		if (!p) fail("missing :port")
+		server = substr(hp, 1, p - 1); port = substr(hp, p + 1)
+	}
+	if (uuid !~ /^[A-Za-z0-9_-]+$/) fail("invalid uuid")
+	if (server !~ /^[A-Za-z0-9.:_-]+$/) fail("invalid server address")
+	if (port !~ /^[0-9]+$/ || port + 0 < 1 || port + 0 > 65535) fail("invalid port")
+
+	n = split(query, kv, "&")
+	for (i = 1; i <= n; i++) {
+		p = index(kv[i], "=")
+		if (p) q[tolower(substr(kv[i], 1, p - 1))] = urldecode(substr(kv[i], p + 1))
+		else if (kv[i] != "") q[tolower(kv[i])] = ""
+	}
+
+	sec = ("security" in q && q["security"] != "") ? tolower(q["security"]) : "none"
+	type = ("type" in q && q["type"] != "") ? tolower(q["type"]) : "tcp"
+	sni = q["sni"] != "" ? q["sni"] : q["peer"]
+	# Optional SNI override (set from the :90 page): the hostname the ISP sees in the TLS
+	# ClientHello. Only for plain TLS; Reality must keep the SNI its server expects.
+	if (SNI_FILE == "") SNI_FILE = "/etc/sing-box/sni.txt"
+	ov = ""
+	if ((getline ov < SNI_FILE) > 0) close(SNI_FILE)
+	gsub(/[[:space:]]/, "", ov)
+	if (ov != "" && ov ~ /^[A-Za-z0-9.-]+$/ && tolower(q["security"]) == "tls") sni = ov
+	host = q["host"] != "" ? q["host"] : sni
+	path = q["path"] != "" ? q["path"] : "/"
+	fp = tolower(q["fp"])
+	insecure = (q["allowinsecure"] == "1" || q["allowinsecure"] == "true" || q["insecure"] == "1")
+
+	tag = name != "" ? name : "VLESS"
+	if (tag == "direct") tag = "vless-" tag
+
+	ob = "{\n      \"type\": \"vless\",\n      \"tag\": " js(tag) ",\n      \"server\": " js(server) ",\n      \"server_port\": " port + 0 ",\n      \"uuid\": " js(uuid)
+	if (q["flow"] != "") ob = ob ",\n      \"flow\": " js(q["flow"])
+	ob = ob ",\n      \"packet_encoding\": \"xudp\""
+
+	if (sec == "tls" || sec == "reality") {
+		if (sec == "reality" && fp == "") fp = "chrome"
+		ob = ob ",\n      \"tls\": {\n        \"enabled\": true,\n        \"server_name\": " js(sni != "" ? sni : server)
+		if (insecure) ob = ob ",\n        \"insecure\": true"
+		if (q["alpn"] != "") ob = ob ",\n        \"alpn\": " strlist(q["alpn"])
+		if (sec == "reality") {
+			if (q["pbk"] == "") fail("reality link without pbk")
+			ob = ob ",\n        \"utls\": { \"enabled\": true, \"fingerprint\": " js(fp) " }"
+			ob = ob ",\n        \"reality\": { \"enabled\": true, \"public_key\": " js(q["pbk"]) ", \"short_id\": " js(q["sid"]) " }"
+		}
+		# Speed over fingerprint: the link's fp= is ignored for plain TLS. Without uTLS, Go's TLS
+		# client on this AES-less Cortex-A7 offers ChaCha20 first (~2x faster than AES-GCM here).
+		# kernel_rx would add ~1.6x more, but kTLS RX leaks kernel memory on OpenWrt 24.10 (Linux 6.6).
+		ob = ob "\n      }"
+	} else if (sec != "none") fail("unsupported security: " sec)
+
+	if (type == "ws") {
+		ed = 0
+		if (match(path, /[?&]ed=[0-9]+/)) {
+			ed = substr(path, RSTART + 4, RLENGTH - 4) + 0
+			path = substr(path, 1, RSTART - 1) substr(path, RSTART + RLENGTH)
+			if (path == "") path = "/"
+		}
+		ob = ob ",\n      \"transport\": {\n        \"type\": \"ws\",\n        \"path\": " js(path)
+		if (host != "") ob = ob ",\n        \"headers\": { \"Host\": " js(host) " }"
+		if (ed > 0) ob = ob ",\n        \"max_early_data\": " ed ",\n        \"early_data_header_name\": \"Sec-WebSocket-Protocol\""
+		ob = ob "\n      }"
+	} else if (type == "httpupgrade") {
+		ob = ob ",\n      \"transport\": { \"type\": \"httpupgrade\", \"path\": " js(path) (host != "" ? ", \"host\": " js(host) : "") " }"
+	} else if (type == "grpc") {
+		ob = ob ",\n      \"transport\": { \"type\": \"grpc\", \"service_name\": " js(q["servicename"]) " }"
+	} else if (type == "http" || type == "h2") {
+		ob = ob ",\n      \"transport\": { \"type\": \"http\", \"path\": " js(path) (host != "" ? ", \"host\": " strlist(host) : "") " }"
+	} else if (type != "tcp") fail("unsupported transport type: " type)
+	ob = ob "\n    }"
+
+	dnsrule = ""
+	if (server !~ /^[0-9.]+$/ && server !~ /:/)
+		dnsrule = "\n      { \"domain\": [" js(server) "], \"server\": \"dns-direct\" }\n    "
+
+	print "{"
+	print "  \"log\": { \"level\": \"warn\", \"timestamp\": true },"
+	print "  \"dns\": {"
+	print "    \"servers\": ["
+	# dns-direct resolves outside the tunnel (only needed if the server is a name): DNS-over-HTTPS
+	# to 1.1.1.1 by IP, so neither the query nor an SNI reveals the name to the ISP.
+	print "      { \"type\": \"https\", \"tag\": \"dns-direct\", \"server\": \"1.1.1.1\" },"
+	print "      { \"type\": \"tcp\", \"tag\": \"dns-remote\", \"server\": \"1.1.1.1\", \"detour\": " js(tag) " }"
+	print "    ],"
+	print "    \"rules\": [" dnsrule "],"
+	print "    \"final\": \"dns-remote\","
+	print "    \"strategy\": \"ipv4_only\""
+	print "  },"
+	print "  \"inbounds\": ["
+	print "    {"
+	print "      \"type\": \"tun\","
+	print "      \"tag\": \"tun-in\","
+	print "      \"interface_name\": \"tun0\","
+	print "      \"address\": [\"172.19.0.1/30\"],"
+	print "      \"mtu\": 1400,"
+	print "      \"auto_route\": true,"
+	print "      \"auto_redirect\": true,"
+	print "      \"strict_route\": false,"
+	print "      \"stack\": \"system\","
+	print "      \"route_exclude_address\": [\"192.168.0.0/16\"]"
+	print "    }"
+	print "  ],"
+	print "  \"outbounds\": ["
+	print "    " ob ","
+	print "    { \"type\": \"direct\", \"tag\": \"direct\" }"
+	print "  ],"
+	print "  \"route\": {"
+	print "    \"rules\": ["
+	print "      { \"inbound\": \"tun-in\", \"action\": \"sniff\" },"
+	print "      { \"protocol\": \"dns\", \"action\": \"hijack-dns\" },"
+	print "      { \"ip_is_private\": true, \"outbound\": \"direct\" },"
+	print "      { \"network\": \"udp\", \"port\": 443, \"action\": \"reject\" }"
+	print "    ],"
+	print "    \"final\": " js(tag) ","
+	print "    \"auto_detect_interface\": true,"
+	print "    \"default_domain_resolver\": \"dns-direct\""
+	print "  }"
+	print "}"
+}

@@ -1,0 +1,19 @@
+From: ex6150v2 build
+Subject: net: ipqess: enlarge RX descriptor ring 128 -> 512
+
+Bursts from the remote VPN server overflow the 128-entry RX ring while all CPUs are busy, so
+the switch drops frames (RxOverFlow) and the sender's TCP backs off. The RFD ring size and
+producer/consumer index fields are 12 bits wide (IPQESS_RFD_RING_SIZE_MASK = 0xFFF) and
+IPQESS_NEXT_IDX needs a power of two.
+
+--- a/drivers/net/ethernet/qualcomm/ipqess/ipqess.h
++++ b/drivers/net/ethernet/qualcomm/ipqess/ipqess.h
+@@ -22,7 +22,7 @@
+ 
+ #define IPQESS_TPD_FROM_CPU_SHIFT 25
+ 
+-#define IPQESS_RX_RING_SIZE 128
++#define IPQESS_RX_RING_SIZE 512
+ #define IPQESS_RX_HEAD_BUFF_SIZE 1540
+ #define IPQESS_TX_RING_SIZE 128
+ #define IPQESS_MAX_RX_QUEUE 8

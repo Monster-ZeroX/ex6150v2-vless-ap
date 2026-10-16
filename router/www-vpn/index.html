@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VPN Manager</title>
+<style>
+:root {
+	--bg: #f4f5f7; --card: #fff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+	--accent: #2f6fed; --ok: #13a35a; --bad: #d33a3a; --warn: #c98a07;
+}
+@media (prefers-color-scheme: dark) {
+	:root { --bg: #11141a; --card: #1a1e27; --text: #e8ebf1; --muted: #8d95a8; --line: #2a303c; --accent: #5b8cff; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 12px; }
+a { color: var(--accent); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+.badge { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+.on .dot { background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 20%, transparent); }
+.off .dot { background: var(--bad); }
+.wait .dot { background: var(--warn); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.stat small { display: block; color: var(--muted); font-size: 12px; }
+.stat b { font-size: 16px; word-break: break-word; }
+.btns { display: flex; gap: 8px; flex-wrap: wrap; }
+button { font: inherit; font-weight: 600; border: 1px solid var(--line); background: var(--card); color: var(--text); padding: 9px 16px; border-radius: 8px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .5; cursor: wait; }
+input, textarea { width: 100%; font: 13px/1.4 ui-monospace, Consolas, monospace; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); margin-bottom: 10px; }
+textarea { min-height: 90px; resize: vertical; }
+label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 520px) { .row { grid-template-columns: 1fr; } }
+.msg { min-height: 1.5em; margin-top: 10px; font-size: 14px; }
+.msg.err { color: var(--bad); } .msg.ok { color: var(--ok); }
+.muted { color: var(--muted); font-size: 13px; }
+.hidden { display: none; }
+.links { display: flex; gap: 14px; align-items: center; }
+</style>
+</head>
+<body>
+<main>
+	<header>
+		<h1>VLESS VPN Manager</h1>
+		<div class="links">
+			<a id="luci" class="muted" href="/">LuCI dashboard →</a>
+			<a id="logout" class="muted hidden" href="#">Log out</a>
+		</div>
+		<span id="badge" class="badge wait"><span class="dot"></span><span id="badgeText">Checking…</span></span>
+	</header>
+
+	<!-- first run -->
+	<section id="setupView" class="card hidden">
+		<h2>Welcome — set up your VPN access point</h2>
+		<label for="sPw">Admin password (also the LuCI / SSH root password, min. 8 characters)</label>
+		<input id="sPw" type="password" autocomplete="new-password">
+		<div class="row">
+			<div><label for="sSsid">Wi-Fi name</label><input id="sSsid" maxlength="32" autocomplete="off"></div>
+			<div><label for="sKey">Wi-Fi password (8–63 characters)</label><input id="sKey" type="password" maxlength="63" autocomplete="new-password"></div>
+		</div>
+		<label for="sLink">VLESS link</label>
+		<textarea id="sLink" spellcheck="false" placeholder="vless://uuid@server:443?security=tls&amp;type=tcp&amp;sni=…#Name"></textarea>
+		<label for="sSni">SNI override (optional — the hostname shown to network observers instead of your server's)</label>
+		<input id="sSni" spellcheck="false" placeholder="leave empty to use the SNI from the link">
+		<div class="btns"><button class="primary" id="setupBtn">Finish setup</button></div>
+		<p class="muted">Already running this project from an older version? Just set a password and leave the other fields empty: your link and Wi-Fi stay as they are.</p>
+		<div id="setupMsg" class="msg"></div>
+	</section>
+
+	<!-- login -->
+	<section id="loginView" class="card hidden">
+		<h2>Log in</h2>
+		<label for="lPw">Admin password</label>
+		<input id="lPw" type="password" autocomplete="current-password">
+		<div class="btns"><button class="primary" id="loginBtn">Log in</button></div>
+		<div id="loginMsg" class="msg"></div>
+	</section>
+
+	<div id="appView" class="hidden">
+		<section class="card">
+			<h2>Status</h2>
+			<div class="grid">
+				<div class="stat"><small>Server</small><b id="srv">–</b></div>
+				<div class="stat"><small>Visible hostname (SNI)</small><b id="sniNow">–</b></div>
+				<div class="stat"><small>Wi-Fi traffic</small><b id="mode">–</b></div>
+				<div class="stat"><small>Ping to server</small><b id="ping">–</b></div>
+				<div class="stat"><small>Public IP</small><b id="ip">–</b></div>
+				<div class="stat"><small>ISP</small><b id="isp">–</b></div>
+				<div class="stat"><small>Location</small><b id="loc">–</b></div>
+			</div>
+			<p class="muted">Free RAM: <span id="mem">–</span> MB</p>
+		</section>
+
+		<section class="card">
+			<h2>Controls</h2>
+			<div class="btns">
+				<button class="primary" data-act="start">Start VPN</button>
+				<button class="danger" data-act="stop">Stop VPN (Bypass)</button>
+				<button data-act="restart">Restart VPN</button>
+				<button id="refresh">Refresh IP &amp; ping</button>
+			</div>
+			<div id="msg" class="msg"></div>
+		</section>
+
+		<section class="card">
+			<h2>VLESS link</h2>
+			<textarea id="link" spellcheck="false" placeholder="vless://uuid@server:443?security=tls&amp;type=tcp&amp;sni=…#Name"></textarea>
+			<div class="btns"><button class="primary" id="save">Save &amp; Connect</button></div>
+		</section>
+
+		<section class="card">
+			<h2>SNI (hostname visible on the network)</h2>
+			<input id="sni" spellcheck="false" placeholder="leave empty to use the SNI from the link">
+			<div class="btns"><button class="primary" id="saveSni">Save SNI &amp; Reconnect</button></div>
+			<p class="muted">The only hostname visible to observers on your line. Your server's certificate is still verified against its real name, without revealing it.</p>
+		</section>
+
+		<section class="card">
+			<h2>Wi-Fi</h2>
+			<div class="row">
+				<div><label for="wSsid">Network name</label><input id="wSsid" maxlength="32" autocomplete="off"></div>
+				<div><label for="wKey">Password (8–63 characters)</label><input id="wKey" type="password" maxlength="63" autocomplete="new-password"></div>
+			</div>
+			<div class="btns"><button class="primary" id="wifiBtn">Save Wi-Fi</button></div>
+		</section>
+
+		<section class="card">
+			<h2>Admin password</h2>
+			<label for="nPw">New password (also changes the LuCI / SSH root password)</label>
+			<input id="nPw" type="password" autocomplete="new-password">
+			<div class="btns"><button id="pwBtn">Change password</button></div>
+		</section>
+	</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const api = (action, opts = {}) => fetch('/cgi-bin/vpn?action=' + action, { credentials: 'same-origin', ...opts }).then(r => r.json());
+const post = (action, body = {}) => api(action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+const HOST_RE = /^[A-Za-z0-9.-]+$/;
+let linkLoaded = false, view = '', timer = null;
+
+$('luci').href = `${location.protocol}//${location.hostname}/cgi-bin/luci/`;
+
+function say(el, text, cls) { $(el).textContent = text; $(el).className = 'msg ' + (cls || ''); }
+
+function show(v) {
+	if (view === v) return;
+	view = v;
+	for (const id of ['setupView', 'loginView', 'appView']) $(id).classList.toggle('hidden', id !== v);
+	$('logout').classList.toggle('hidden', v !== 'appView');
+	if (v === 'appView') { linkLoaded = false; netinfo(); }
+}
+
+function badge(s) {
+	const b = $('badge');
+	if (s.tunnel) { b.className = 'badge on'; $('badgeText').textContent = 'VPN Connected'; }
+	else if (s.enabled) { b.className = 'badge wait'; $('badgeText').textContent = 'Connecting…'; }
+	else { b.className = 'badge off'; $('badgeText').textContent = s.configured ? 'VPN Stopped' : 'Not configured'; }
+}
+
+async function status() {
+	try {
+		const s = await api('status');
+		badge(s);
+		if (s.setup_required) return show('setupView');
+		if (!s.authed) return show('loginView');
+		show('appView');
+		$('srv').textContent = s.server ? `${s.server.tag} (${s.server.server}:${s.server.port})` : '–';
+		$('mode').textContent = s.enabled ? 'VPN only (kill switch on)' : 'Normal internet (bypass)';
+		$('mem').textContent = s.mem_free_mb ?? '–';
+		$('sniNow').textContent = (s.server && s.server.sni) || '–';
+		if (!linkLoaded) { $('link').value = s.link || ''; $('sni').value = s.sni_override || ''; $('wSsid').value = s.wifi_ssid || ''; linkLoaded = true; }
+	} catch (e) { $('badge').className = 'badge off'; $('badgeText').textContent = 'Router unreachable'; }
+}
+
+function netinfo() {
+	$('ip').textContent = $('isp').textContent = $('loc').textContent = '…'; $('ping').textContent = '…';
+	api('ipinfo').then(i => {
+		$('ip').textContent = i.query || '–'; $('isp').textContent = i.isp || i.org || '–';
+		$('loc').textContent = [i.city, i.country].filter(Boolean).join(', ') || '–';
+	}).catch(() => { $('ip').textContent = 'unavailable'; });
+	api('ping').then(p => {
+		$('ping').textContent = p.avg_ms != null ? `${p.avg_ms} ms (${p.loss_pct}% loss)` : 'no reply';
+	}).catch(() => { $('ping').textContent = 'no reply'; });
+}
+
+async function act(action, body, msgEl = 'msg') {
+	document.querySelectorAll('button').forEach(b => b.disabled = true);
+	say(msgEl, 'Working…');
+	let r = {};
+	try {
+		r = await post(action, body);
+		say(msgEl, r.ok ? r.message : r.error, r.ok ? 'ok' : 'err');
+		if (r.ok) setTimeout(() => { status(); if (view === 'appView') netinfo(); }, 4000);
+	} catch (e) { say(msgEl, 'Request failed: ' + e.message, 'err'); }
+	document.querySelectorAll('button').forEach(b => b.disabled = false);
+	status();
+	return r;
+}
+
+$('setupBtn').onclick = () => {
+	const body = { password: $('sPw').value, wifi_ssid: $('sSsid').value.trim(), wifi_key: $('sKey').value,
+		link: $('sLink').value.trim(), sni: $('sSni').value.trim() };
+	if (body.password.length < 8) return say('setupMsg', 'Password must be at least 8 characters', 'err');
+	if ((body.wifi_ssid || body.wifi_key) && (!body.wifi_ssid || body.wifi_key.length < 8)) return say('setupMsg', 'Enter a Wi-Fi name and a password of 8+ characters (or leave both empty)', 'err');
+	if (body.link && !body.link.startsWith('vless://')) return say('setupMsg', 'The link must start with vless://', 'err');
+	if (body.sni && !HOST_RE.test(body.sni)) return say('setupMsg', 'SNI must be a hostname', 'err');
+	act('setup', body, 'setupMsg');
+};
+$('loginBtn').onclick = () => act('login', { password: $('lPw').value }, 'loginMsg').then(() => { $('lPw').value = ''; });
+$('lPw').onkeydown = e => { if (e.key === 'Enter') $('loginBtn').click(); };
+$('logout').onclick = e => { e.preventDefault(); act('logout', {}); };
+document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => act(b.dataset.act));
+$('refresh').onclick = netinfo;
+$('save').onclick = () => {
+	const link = $('link').value.trim();
+	if (!link.startsWith('vless://')) return say('msg', 'Paste a link that starts with vless://', 'err');
+	act('save', { link });
+};
+$('saveSni').onclick = () => {
+	const sni = $('sni').value.trim();
+	if (sni && !HOST_RE.test(sni)) return say('msg', 'SNI must be a hostname like www.example.com', 'err');
+	act('sni', { sni });
+};
+$('wifiBtn').onclick = () => {
+	const ssid = $('wSsid').value.trim(), key = $('wKey').value;
+	if (!ssid || key.length < 8) return say('msg', 'Enter a Wi-Fi name and a password of 8+ characters', 'err');
+	act('wifi', { ssid, key }).then(() => { $('wKey').value = ''; });
+};
+$('pwBtn').onclick = () => {
+	const password = $('nPw').value;
+	if (password.length < 8) return say('msg', 'Password must be at least 8 characters', 'err');
+	act('password', { password }).then(() => { $('nPw').value = ''; });
+};
+
+status();
+setInterval(status, 5000);
+</script>
+</body>
+</html>

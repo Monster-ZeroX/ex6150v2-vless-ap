@@ -1,0 +1,73 @@
+--- a/common/bufio/copy.go
++++ b/common/bufio/copy.go
+@@ -215,6 +215,70 @@
+ 		if !options.IncreaseBuffer && session.options.IncreaseBufferAfter > 0 && n >= session.options.IncreaseBufferAfter {
+ 			options.IncreaseBuffer = true
+ 		}
++		// ex6150v2 patch: once a connection is a bulk transfer and can no longer switch
++		// protocols mid-stream, overlap reading (TLS decrypt) with writing on two goroutines.
++		if options.IncreaseBuffer && !session.options.Handshake.Upgradable() {
++			pipelinedN, pipelinedErr := copyPipelined(session, destination, source, options)
++			return n + pipelinedN, pipelinedErr
++		}
++	}
++}
++
++// pipelineDepth is how many read-ahead buffers may wait for the writer.
++const pipelineDepth = 4
++
++type pipelineItem struct {
++	buffer *buf.Buffer
++	err    error
++}
++
++// copyPipelined is copyExtendedWithPool split into a reader goroutine and this writer loop,
++// joined by a FIFO channel: byte order is unchanged, but a single connection can use one
++// CPU core for reading/decryption and another for the write syscalls. On a slow multi-core
++// router this lifts the per-connection ceiling. Only used for bulk, non-upgradable copies.
++func copyPipelined(session *CopySession, destination N.ExtendedWriter, source N.ExtendedReader, options N.ReadWaitOptions) (n int64, err error) {
++	queue := make(chan pipelineItem, pipelineDepth)
++	done := make(chan struct{})
++	defer close(done)
++	go func() {
++		for {
++			buffer := options.NewBuffer()
++			readErr := source.ReadBuffer(buffer)
++			if readErr != nil {
++				buffer.Release()
++				select {
++				case queue <- pipelineItem{err: readErr}:
++				case <-done:
++				}
++				return
++			}
++			options.PostReturn(buffer)
++			select {
++			case queue <- pipelineItem{buffer: buffer}:
++			case <-done:
++				buffer.Release()
++				return
++			}
++		}
++	}()
++	for {
++		item := <-queue
++		if item.err != nil {
++			if errors.Is(item.err, io.EOF) {
++				return n, nil
++			}
++			return n, item.err
++		}
++		dataLen := item.buffer.Len()
++		err = destination.WriteBuffer(item.buffer)
++		if err != nil {
++			item.buffer.Leak()
++			return n, err
++		}
++		n += int64(dataLen)
++		if err = session.Transfer(int64(dataLen)); err != nil {
++			return n, err
++		}
+ 	}
+ }
+ 

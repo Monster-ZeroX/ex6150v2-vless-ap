@@ -1,0 +1,14 @@
+#!/bin/sh
+# Refresh the server certificate pin / tunnel bypass IPs, then run sing-box.
+# The binary is baked into the read-only image, so its code pages come from flash, not RAM.
+# At boot the WAN may not be up yet: vpn-refresh exits non-zero until it can resolve the
+# server, so keep trying for up to a minute before starting without a refresh.
+
+n=0
+until /usr/libexec/vpn-refresh >/dev/null; do
+	n=$((n + 1))
+	[ $n -ge 30 ] && { logger -t sing-box-start "vpn-refresh kept failing; starting with existing config"; break; }
+	sleep 2
+done
+mkdir -p /tmp/sing-box
+exec /usr/bin/sing-box "$@"

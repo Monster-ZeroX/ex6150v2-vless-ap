@@ -1,0 +1,143 @@
+#!/bin/sh
+# ex6150v2-vless-ap: runs once after every flash of this image.
+# Fresh install: the Ethernet port is the WAN and gets its address by DHCP from your home router
+#   (so it never clashes with it); Wi-Fi is a separate network 192.168.2.1/24 whose traffic all
+#   goes through the VPN. Wi-Fi stays OFF until you finish setup on http://<extender-ip>:90.
+# Upgrade with settings kept: only migrates to the current layout; your setup stays.
+
+fresh=
+[ -f /etc/sing-box/admin ] || [ -f /etc/sing-box/link.txt ] || fresh=1
+
+if [ -n "$fresh" ]; then
+	BR=$(uci show network | sed -n "s/^network\.\([^.=]*\)\.name='br-lan'$/\1/p" | head -n1)
+	ETH=$(uci -q get network.$BR.ports); ETH=${ETH%% *}; [ -n "$ETH" ] || ETH=lan
+	uci -q delete network.$BR.ports
+	uci set network.$BR.bridge_empty='1'
+	uci set network.lan.ipaddr='192.168.2.1'
+	uci set network.lan.netmask='255.255.255.0'
+	uci -q delete network.wan; uci -q delete network.wan6
+	uci set network.wan=interface
+	uci set network.wan.device="$ETH"
+	uci set network.wan.proto='dhcp'
+	uci commit network
+
+	uci set dhcp.lan.start='100'; uci set dhcp.lan.limit='151'; uci set dhcp.lan.leasetime='12h'
+	uci set dhcp.wan=dhcp; uci set dhcp.wan.interface='wan'; uci set dhcp.wan.ignore='1'
+	uci commit dhcp
+
+	uci set system.@system[0].hostname='ex6150v2-vpn'
+	for r in radio0 radio1; do uci -q set wireless.$r.disabled='1'; done
+	uci commit wireless
+fi
+
+# --- firewall: SSH (22), LuCI (80) and the VPN manager (90) from the home network ----------
+for s in $(uci show firewall | sed -n "s/^firewall\.\([^.=]*\)\.name='Allow-WAN-9090'$/\1/p"); do
+	uci delete firewall.$s
+done
+for p in 22 80 90; do
+	uci show firewall | grep -q "\.name='Allow-WAN-$p'" && continue
+	r=$(uci add firewall rule)
+	uci set firewall.$r.name="Allow-WAN-$p"
+	uci set firewall.$r.src='wan'
+	uci set firewall.$r.family='ipv4'
+	uci set firewall.$r.proto='tcp'
+	uci set firewall.$r.dest_port="$p"
+	uci set firewall.$r.target='ACCEPT'
+	# SSH and LuCI from the home network only once setup has set a root password
+	[ -n "$fresh" ] && [ $p != 90 ] && uci set firewall.$r.enabled='0'
+done
+if ! uci show firewall | grep -q "\.name='vpn'"; then
+	z=$(uci add firewall zone)
+	uci set firewall.$z.name='vpn'
+	uci add_list firewall.$z.device='tun0'
+	uci set firewall.$z.input='ACCEPT'; uci set firewall.$z.output='ACCEPT'; uci set firewall.$z.forward='ACCEPT'
+	uci set firewall.$z.mtu_fix='1'
+	f=$(uci add firewall forwarding); uci set firewall.$f.src='lan'; uci set firewall.$f.dest='vpn'
+fi
+# kill switch + leak guards (one switch): on = Wi-Fi clients can only use the tunnel, and the
+# router never sends plaintext DNS/HTTP out of the WAN. Turned on when a VLESS link is saved.
+ks=$(uci -q get firewall.vpn_killswitch.enabled)
+[ -n "$ks" ] || { [ -f /etc/sing-box/link.txt ] && ks=1 || ks=0; }
+uci set firewall.vpn_killswitch=rule
+uci set firewall.vpn_killswitch.name='VPN-Killswitch'
+uci set firewall.vpn_killswitch.src='lan'
+uci set firewall.vpn_killswitch.dest='wan'
+uci set firewall.vpn_killswitch.proto='all'
+uci set firewall.vpn_killswitch.target='REJECT'
+uci set firewall.vpn_killswitch.enabled="$ks"
+uci set firewall.vpn_leak_dns=rule
+uci set firewall.vpn_leak_dns.name='VPN-No-Plain-DNS'
+uci set firewall.vpn_leak_dns.dest='wan'
+uci set firewall.vpn_leak_dns.proto='tcp udp'
+uci set firewall.vpn_leak_dns.dest_port='53'
+uci set firewall.vpn_leak_dns.target='REJECT'
+uci set firewall.vpn_leak_dns.enabled="$ks"
+uci set firewall.vpn_leak_http=rule
+uci set firewall.vpn_leak_http.name='VPN-No-Plain-HTTP'
+uci set firewall.vpn_leak_http.dest='wan'
+uci set firewall.vpn_leak_http.proto='tcp'
+uci set firewall.vpn_leak_http.dest_port='80'
+uci set firewall.vpn_leak_http.target='REJECT'
+uci set firewall.vpn_leak_http.enabled="$ks"
+uci set firewall.@defaults[0].flow_offloading='1'
+uci commit firewall
+
+# --- web: LuCI dashboard on :80 (main instance), VPN manager on :90 (vpnui instance) ------
+uci -q delete uhttpd.main.listen_http
+uci -q delete uhttpd.main.listen_https
+uci add_list uhttpd.main.listen_http='0.0.0.0:80'
+uci set uhttpd.main.home='/www'
+uci set uhttpd.main.cgi_prefix='/cgi-bin'
+uci -q delete uhttpd.main.index_page
+uci set uhttpd.main.redirect_https='0'
+uci set uhttpd.main.rfc1918_filter='1'
+[ -f /usr/share/ucode/luci/uhttpd.uc ] && uci set uhttpd.main.ucode_prefix='/cgi-bin/luci=/usr/share/ucode/luci/uhttpd.uc'
+[ -d /usr/share/rpcd ] && uci set uhttpd.main.ubus_prefix='/ubus'
+uci -q delete uhttpd.vpnui
+uci set uhttpd.vpnui=uhttpd
+uci add_list uhttpd.vpnui.listen_http='0.0.0.0:90'
+uci set uhttpd.vpnui.home='/www-vpn'
+uci set uhttpd.vpnui.cgi_prefix='/cgi-bin'
+uci set uhttpd.vpnui.index_page='index.html'
+uci set uhttpd.vpnui.script_timeout='60'
+uci set uhttpd.vpnui.network_timeout='30'
+uci set uhttpd.vpnui.max_requests='5'
+uci set uhttpd.vpnui.no_dirlists='1'
+uci set uhttpd.vpnui.rfc1918_filter='1'
+uci commit uhttpd
+
+# --- privacy: NTP by IP (Cloudflare time), so clock sync needs no plaintext DNS ---------------
+uci -q delete system.ntp.server
+uci add_list system.ntp.server='162.159.200.1'
+uci add_list system.ntp.server='162.159.200.123'
+
+# --- memory: zram swap ---------------------------------------------------------------------
+uci set system.@system[0].zram_size_mb='96'
+uci set system.@system[0].zram_comp_algo='lzo-rle'
+uci commit system
+
+# --- sing-box ------------------------------------------------------------------------------
+mkdir -p /etc/sing-box
+chmod 700 /etc/sing-box
+if [ -f /etc/sing-box/link.txt ]; then
+	/usr/libexec/vless2json /etc/sing-box/link.txt > /etc/sing-box/config.json.new && mv /etc/sing-box/config.json.new /etc/sing-box/config.json
+fi
+rm -f /etc/sing-box/config.json.tun-backup /etc/sing-box/cache.db
+
+# keep the VPN settings across upgrades (network, Wi-Fi, passwords are kept by OpenWrt itself)
+printf '%s\n' '/etc/sing-box/' > /etc/sysupgrade.conf
+
+grep -q vpn-refresh /etc/crontabs/root 2>/dev/null || echo '17 */6 * * * /usr/libexec/vpn-refresh --restart >/dev/null' >> /etc/crontabs/root
+/etc/init.d/cron enable
+/etc/init.d/vpn-tune enable
+
+# VPN on only when configured and not left in bypass mode
+if [ -f /etc/sing-box/link.txt ] && [ "$ks" = 1 ]; then
+	/etc/init.d/sing-box enable
+	/usr/libexec/vpn-dns 1
+else
+	/etc/init.d/sing-box disable
+	/usr/libexec/vpn-dns 0
+fi
+
+exit 0

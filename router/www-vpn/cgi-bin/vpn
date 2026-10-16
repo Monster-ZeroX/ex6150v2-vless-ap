@@ -1,0 +1,272 @@
+#!/bin/sh
+# Backend for the :90 VPN manager.
+#   GET  ?action=status                       always allowed (no secrets until logged in)
+#   GET  ?action=ipinfo | ping                login required
+#   POST ?action=setup   first run only: {"password", "wifi_ssid"?, "wifi_key"?, "link"?, "sni"?, "ssh_key"?}
+#   POST ?action=login   {"password"}  -> session cookie (12 h)
+#   POST ?action=logout | start | stop | restart
+#   POST ?action=save    {"link":"vless://..."}
+#   POST ?action=sni     {"sni":"host"}
+#   POST ?action=wifi    {"ssid", "key"}
+#   POST ?action=password {"password"}  (changes the manager + root password)
+# POSTs must be Content-Type: application/json, and the session cookie is SameSite=Strict, so
+# other websites cannot trigger them (CORS preflight + no cross-site cookie).
+
+APP=ex6150v2-vless-ap
+SVC=/etc/init.d/sing-box
+DIR=/etc/sing-box
+CONF=$DIR/config.json
+ADMIN=$DIR/admin
+SESS=/tmp/vpn-ui-sessions
+BIN=/usr/bin/sing-box
+TTL=43200
+
+reply() { # status json [extra-header]
+	printf 'Status: %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n' "$1"
+	[ -n "$3" ] && printf '%s\r\n' "$3"
+	printf '\r\n%s\n' "$2"
+	exit 0
+}
+err() { reply "$1" "$(jq -nc --arg e "$2" '{ok:false,error:$e}')"; }
+ok() { reply "200 OK" "$(jq -nc --arg m "$1" '{ok:true,message:$m}')" "$2"; }
+
+action=${QUERY_STRING#*action=}
+action=${action%%&*}
+
+body=
+if [ "$REQUEST_METHOD" = POST ]; then
+	case "$CONTENT_TYPE" in application/json*) ;; *) err "415 Unsupported Media Type" "JSON body required" ;; esac
+	[ "${CONTENT_LENGTH:-0}" -le 8192 ] || err "413 Payload Too Large" "body too large"
+	[ "${CONTENT_LENGTH:-0}" -gt 0 ] && body=$(head -c "$CONTENT_LENGTH")
+	[ -z "$body" ] || printf '%s' "$body" | jq -e 'type == "object"' >/dev/null 2>&1 || err "400 Bad Request" "invalid JSON"
+fi
+field() { printf '%s' "$body" | jq -r --arg k "$1" '.[$k] // empty | tostring' 2>/dev/null; }
+
+# --- auth ----------------------------------------------------------------------------------
+# /etc/sing-box/admin = "<salt>:<sha256(salt + password)>"; the same password is set for root
+# (LuCI and SSH). Sessions are random tokens in RAM with an expiry time.
+hash() { printf '%s' "$1$2" | sha256sum | cut -d' ' -f1; }
+check_password() {
+	[ -f "$ADMIN" ] || return 1
+	salt=$(cut -d: -f1 "$ADMIN"); want=$(cut -d: -f2 "$ADMIN")
+	[ "$(hash "$salt" "$1")" = "$want" ]
+}
+valid_password() {
+	[ ${#1} -ge 8 ] || err "400 Bad Request" "password must be at least 8 characters"
+	[ ${#1} -le 128 ] || err "400 Bad Request" "password too long"
+	case "$1" in *"
+"*) err "400 Bad Request" "password must be one line" ;; esac
+}
+set_password() {
+	salt=$(head -c 16 /dev/urandom | hexdump -ve '1/1 "%02x"')
+	umask 077
+	echo "$salt:$(hash "$salt" "$1")" > "$ADMIN.new" && mv "$ADMIN.new" "$ADMIN"
+	printf '%s\n%s\n' "$1" "$1" | passwd root >/dev/null 2>&1
+}
+new_session() { # prints the Set-Cookie header
+	mkdir -p "$SESS"; chmod 700 "$SESS"
+	tok=$(head -c 24 /dev/urandom | hexdump -ve '1/1 "%02x"')
+	echo $(( $(date +%s) + TTL )) > "$SESS/$tok"
+	echo "Set-Cookie: vpnsid=$tok; Path=/; Max-Age=$TTL; HttpOnly; SameSite=Strict"
+}
+authed=false
+sid=$(printf '%s' "$HTTP_COOKIE" | tr ';' '\n' | sed -n 's/^ *vpnsid=\([0-9a-f]\{48\}\) *$/\1/p' | head -n1)
+if [ -n "$sid" ] && [ -f "$SESS/$sid" ]; then
+	if [ "$(cat "$SESS/$sid")" -gt "$(date +%s)" ] 2>/dev/null; then authed=true; else rm -f "$SESS/$sid"; fi
+fi
+need_auth() {
+	[ -f "$ADMIN" ] || err "403 Forbidden" "setup required"
+	$authed || err "401 Unauthorized" "login required"
+}
+
+# --- VPN helpers ---------------------------------------------------------------------------
+# Kill switch on = Wi-Fi clients cannot bypass the tunnel, and the router itself cannot send
+# plaintext DNS/HTTP out of the WAN (no hostname leaks while the tunnel restarts).
+# fw4 reload drops sing-box's auto_redirect rules, so sing-box is (re)started after it.
+killswitch() {
+	[ "$(uci -q get firewall.vpn_killswitch.enabled)" = "$1" ] && return
+	for r in vpn_killswitch vpn_leak_dns vpn_leak_http; do
+		uci -q set firewall.$r.enabled="$1"
+	done
+	uci commit firewall
+	/usr/libexec/vpn-dns "$1"
+	fw4 -q reload
+}
+vpn_on() { killswitch 1; $SVC enable; $SVC restart >/dev/null 2>&1; }
+
+server_info() {
+	jq -c '[.outbounds[] | select(.type == "vless")][0] | {tag, server, port: .server_port, sni: (.tls.server_name // ""), transport: (.transport.type // "tcp")}' "$CONF" 2>/dev/null
+}
+
+# validate + install a link; on failure prints the reason and returns 1
+install_link() {
+	tmp=/tmp/vpn-ui.$$
+	printf '%s\n' "$1" > $tmp.link
+	if ! /usr/libexec/vless2json $tmp.link > $tmp.json 2> $tmp.err; then
+		msg=$(cat $tmp.err); rm -f $tmp.*; echo "${msg#error: }"; return 1
+	fi
+	if [ -x "$BIN" ] && ! "$BIN" check -c $tmp.json > $tmp.err 2>&1; then
+		msg=$(tail -n 1 $tmp.err); rm -f $tmp.*; echo "sing-box rejected config: $msg"; return 1
+	fi
+	cp -f $CONF $CONF.bak 2>/dev/null
+	mv $tmp.json $CONF
+	mv $tmp.link $DIR/link.txt
+	rm -f $tmp.* /tmp/sing-box/cache.db
+}
+
+valid_sni() {
+	case "$1" in *[!A-Za-z0-9.-]*) return 1 ;; esac
+	[ ${#1} -le 253 ]
+}
+write_sni() { if [ -n "$1" ]; then echo "$1" > $DIR/sni.txt; else rm -f $DIR/sni.txt; fi; }
+
+# Wi-Fi: one network name on both bands (WPA2-PSK, bridged to the VPN LAN)
+check_wifi() { # ssid key
+	[ -n "$1" ] && [ ${#1} -le 32 ] || err "400 Bad Request" "Wi-Fi name must be 1-32 characters"
+	[ ${#2} -ge 8 ] && [ ${#2} -le 63 ] || err "400 Bad Request" "Wi-Fi password must be 8-63 characters"
+}
+set_wifi() { # ssid key
+	for r in radio0 radio1; do
+		uci -q get wireless.$r >/dev/null || continue
+		uci set wireless.default_$r=wifi-iface
+		uci set wireless.default_$r.device=$r
+		uci set wireless.default_$r.mode='ap'
+		uci set wireless.default_$r.network='lan'
+		uci set wireless.default_$r.ssid="$1"
+		uci set wireless.default_$r.encryption='psk2+ccmp'
+		uci set wireless.default_$r.key="$2"
+		uci set wireless.$r.disabled='0'
+	done
+	uci commit wireless
+	( sleep 2; wifi reload ) >/dev/null 2>&1 &
+}
+
+case "$REQUEST_METHOD:$action" in
+GET:status)
+	running=false; pidof sing-box >/dev/null && running=true
+	tunnel=false; $running && [ -d /sys/class/net/tun0 ] && tunnel=true
+	enabled=false; $SVC enabled && enabled=true
+	setup=false; [ -f "$ADMIN" ] || setup=true
+	configured=false; [ -f $DIR/link.txt ] && configured=true
+	pub=$(jq -nc --arg app $APP --argjson setup $setup --argjson authed $authed --argjson configured $configured \
+		--argjson running $running --argjson tunnel $tunnel --argjson enabled $enabled \
+		'{ok:true,app:$app,setup_required:$setup,authed:$authed,configured:$configured,running:$running,tunnel:$tunnel,enabled:$enabled}')
+	$authed || reply "200 OK" "$pub"
+	mem=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo)
+	reply "200 OK" "$(printf '%s' "$pub" | jq -c --argjson srv "$(server_info || echo null)" --arg mem "$mem" \
+		--arg link "$(cat $DIR/link.txt 2>/dev/null)" \
+		--arg sniov "$(cat $DIR/sni.txt 2>/dev/null)" \
+		--arg ssid "$(uci -q get wireless.default_radio0.ssid)" \
+		'. + {server:$srv,sni_override:$sniov,mem_free_mb:($mem|tonumber? // null),link:$link,wifi_ssid:$ssid}')"
+	;;
+GET:ipinfo)
+	need_auth
+	out=$(uclient-fetch -q -T 8 -O - 'http://ip-api.com/json/?fields=status,message,query,isp,org,country,city' 2>/dev/null)
+	[ -n "$out" ] || err "502 Bad Gateway" "ip-api.com unreachable"
+	reply "200 OK" "$out"
+	;;
+GET:ping)
+	need_auth
+	host=$(server_info | jq -r '.server // empty')
+	[ -n "$host" ] || err "500 Internal Server Error" "no server configured"
+	. /lib/functions/network.sh
+	network_get_device wandev wan
+	res=$(ping -c 3 -W 2 ${wandev:+-I "$wandev"} "$host" 2>&1)
+	avg=$(echo "$res" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')
+	loss=$(echo "$res" | sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p')
+	reply "200 OK" "$(jq -nc --arg h "$host" --arg avg "$avg" --arg loss "$loss" \
+		'{ok:true,host:$h,avg_ms:($avg|tonumber? // null),loss_pct:($loss|tonumber? // null)}')"
+	;;
+POST:setup)
+	# first run only; every field but the password is optional, so an existing install can
+	# simply add a password and keep its link and Wi-Fi
+	[ -f "$ADMIN" ] && err "409 Conflict" "already set up - log in instead"
+	pw=$(field password); valid_password "$pw"
+	ssid=$(field wifi_ssid); wkey=$(field wifi_key); link=$(field link); sni=$(field sni | tr -d ' \t\r\n')
+	sshkey=$(field ssh_key)
+	[ -z "$ssid$wkey" ] || check_wifi "$ssid" "$wkey"
+	valid_sni "$sni" || err "400 Bad Request" "invalid SNI hostname"
+	case "$sshkey" in ""|"ssh-ed25519 "*|"ssh-rsa "*|"ecdsa-sha2-"*) ;; *) err "400 Bad Request" "unsupported SSH key" ;; esac
+	case "$sshkey" in *"
+"*) err "400 Bad Request" "one SSH key only" ;; esac
+	mkdir -p $DIR
+	if [ -n "$link" ]; then
+		old_sni=$(cat $DIR/sni.txt 2>/dev/null)
+		write_sni "$sni"
+		e=$(install_link "$link") || { write_sni "$old_sni"; err "400 Bad Request" "$e"; }
+	fi
+	set_password "$pw"
+	if [ -n "$sshkey" ]; then
+		mkdir -p /etc/dropbear; chmod 700 /etc/dropbear
+		grep -qxF "$sshkey" /etc/dropbear/authorized_keys 2>/dev/null || echo "$sshkey" >> /etc/dropbear/authorized_keys
+		chmod 600 /etc/dropbear/authorized_keys
+	fi
+	[ -z "$ssid" ] || set_wifi "$ssid" "$wkey"
+	# root has a password now: open SSH and LuCI to the home network
+	for s in $(uci show firewall | sed -n "s/^firewall\.\([^.=]*\)\.name='Allow-WAN-\(22\|80\)'$/\1/p"); do
+		uci -q delete firewall.$s.enabled
+	done
+	uci commit firewall
+	if [ -n "$link" ]; then vpn_on; else fw4 -q reload; fi
+	ok "Setup complete." "$(new_session)"
+	;;
+POST:login)
+	if ! check_password "$(field password)"; then sleep 2; err "401 Unauthorized" "wrong password"; fi
+	now=$(date +%s)
+	for f in "$SESS"/*; do [ -f "$f" ] && [ "$(cat "$f")" -le "$now" ] 2>/dev/null && rm -f "$f"; done
+	ok "Logged in." "$(new_session)"
+	;;
+POST:logout)
+	[ -n "$sid" ] && rm -f "$SESS/$sid"
+	ok "Logged out." "Set-Cookie: vpnsid=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+	;;
+POST:password)
+	need_auth
+	pw=$(field password); valid_password "$pw"
+	set_password "$pw"
+	rm -f "$SESS"/*
+	ok "Password changed." "$(new_session)"
+	;;
+POST:wifi)
+	need_auth
+	ssid=$(field ssid); wkey=$(field key)
+	check_wifi "$ssid" "$wkey"
+	set_wifi "$ssid" "$wkey"
+	ok "Wi-Fi updated. Reconnect your devices with the new name/password."
+	;;
+POST:save)
+	need_auth
+	link=$(field link)
+	[ -n "$link" ] || err "400 Bad Request" "missing link"
+	e=$(install_link "$link") || err "400 Bad Request" "$e"
+	vpn_on
+	reply "200 OK" "$(jq -nc --argjson srv "$(server_info)" '{ok:true,message:"Saved. Reconnecting...",server:$srv}')"
+	;;
+POST:sni)
+	# SNI override: the only hostname visible on the line. Empty = use the SNI from the link.
+	need_auth
+	sni=$(field sni | tr -d ' \t\r\n')
+	valid_sni "$sni" || err "400 Bad Request" "invalid hostname"
+	[ -f $DIR/link.txt ] || err "400 Bad Request" "save a VLESS link first"
+	write_sni "$sni"
+	/usr/libexec/vless2json $DIR/link.txt > /tmp/vpn-ui.$$.json 2>/dev/null || { rm -f /tmp/vpn-ui.$$.json; err "500 Internal Server Error" "could not rebuild config"; }
+	mv /tmp/vpn-ui.$$.json $CONF
+	vpn_on
+	reply "200 OK" "$(jq -nc --arg s "${sni:-from link}" '{ok:true,message:("SNI set to " + $s + ". Reconnecting...")}')"
+	;;
+POST:start|POST:restart)
+	need_auth
+	[ -f $DIR/link.txt ] || err "400 Bad Request" "save a VLESS link first"
+	vpn_on
+	ok "VPN starting"
+	;;
+POST:stop)
+	need_auth
+	$SVC stop >/dev/null 2>&1; $SVC disable
+	killswitch 0
+	ok "VPN stopped - Wi-Fi clients now use the normal connection"
+	;;
+*)
+	err "400 Bad Request" "unknown action"
+	;;
+esac

@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# sing-box VLESS tunnel for Wi-Fi clients (binary in the image: /usr/bin/sing-box)
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CONF=/etc/sing-box/config.json
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/libexec/sing-box-start run -c "$CONF" -D /tmp/sing-box
+	procd_set_param env GOMEMLIMIT=48MiB
+	procd_set_param file "$CONF"
+	# sing-box 1.14 auto_redirect occasionally fails to start ("file exists"); retry quickly
+	procd_set_param respawn 3600 2 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

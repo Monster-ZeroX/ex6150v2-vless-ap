@@ -1,0 +1,17 @@
+#!/bin/sh
+# Where the router's DNS resolver (dnsmasq, which serves every Wi-Fi device) sends queries.
+#   vpn-dns 1  VPN mode: only into the tunnel (172.19.0.2 is the tun peer; sing-box answers
+#              it through the VLESS server). No tunnel = no DNS, never plaintext to the ISP.
+#   vpn-dns 0  bypass mode: the normal upstream servers from the WAN config.
+S=$(uci show dhcp | sed -n "s/^dhcp\.\([^.=]*\)=dnsmasq$/\1/p" | head -n1)
+[ -n "$S" ] || exit 1
+uci -q delete dhcp.$S.server
+if [ "$1" = 1 ]; then
+	uci set dhcp.$S.noresolv='1'
+	uci add_list dhcp.$S.server='172.19.0.2'
+else
+	uci -q delete dhcp.$S.noresolv
+fi
+uci commit dhcp
+/etc/init.d/dnsmasq restart >/dev/null 2>&1
+exit 0

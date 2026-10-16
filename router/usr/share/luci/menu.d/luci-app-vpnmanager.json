@@ -1,0 +1,10 @@
+{
+	"admin/vpnmanager": {
+		"title": "VPN Manager",
+		"order": 95,
+		"action": {
+			"type": "view",
+			"path": "vpnmanager"
+		}
+	}
+}

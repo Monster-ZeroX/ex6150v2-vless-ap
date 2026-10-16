@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# CPU placement tuning for the VLESS AP (measured on phone speed tests and router benchmarks):
+#  - Wi-Fi (ath10k) interrupts on CPU1, off CPU0 which takes every Ethernet interrupt
+#  - Ethernet RX NAPI in softirq instead of kernel threads: threaded NAPI competes with
+#    sing-box for CPU, the 128-entry RX ring overflows and the switch drops packets
+#    (RxOverFlow), which makes the VLESS server back off. Softirq: 0 drops, +3-4%.
+
+START=99
+
+apply() {
+	for irq in $(grep ath10k /proc/interrupts | cut -d: -f1); do
+		echo 2 > /proc/irq/$irq/smp_affinity
+	done
+	[ -w /sys/class/net/eth0/threaded ] && echo 0 > /sys/class/net/eth0/threaded
+}
+
+start() {
+	apply
+	# netifd/packet steering may re-apply defaults once interfaces settle: apply again later
+	( sleep 30; apply ) >/dev/null 2>&1 &
+}

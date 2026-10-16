@@ -1,0 +1,72 @@
+#!/bin/sh
+# Keep the VLESS server reachable, verified and private when the link spoofs SNI:
+#  - resolve the server over DNS-over-HTTPS (1.1.1.1 by IP: no plaintext DNS, no SNI) and
+#    write the IP into the config, so sing-box never resolves the real name itself
+#  - verify the server certificate against its real name while the ClientHello only shows the
+#    spoofed SNI, then pin that key for the tunnel; the real name never appears on the wire
+#  - if the server cannot be verified that way (IP address, self-signed cert), fall back to
+#    allowInsecure, as V2Box/v2rayNG do with such links
+#  - exclude the server's IPs from the tunnel so the router can always reach it directly
+# Prints "changed" when config.json was updated. With --restart, restarts sing-box on change (for cron).
+
+CONF=/etc/sing-box/config.json
+LINK=/etc/sing-box/link.txt
+SB=/usr/bin/sing-box
+log() { logger -t vpn-refresh "$*"; }
+
+# the real server name/port come from the link (config.json holds the resolved IP)
+orig=$(/usr/libexec/vless2json "$LINK" | jq -c '[.outbounds[] | select(.type == "vless")][0]') || exit 1
+server=$(echo "$orig" | jq -r '.server')
+port=$(echo "$orig" | jq -r '.server_port')
+ob=$(jq -c '[.outbounds[] | select(.type == "vless")][0]' "$CONF") || exit 1
+sni=$(echo "$ob" | jq -r '.tls.server_name // empty')
+tls=$(echo "$ob" | jq -r 'if (.tls.enabled == true) and (.tls.reality.enabled != true) then "1" else "" end')
+link_insecure=
+grep -qiE '[?&](allowinsecure|insecure)=(1|true)' "$LINK" 2>/dev/null && link_insecure=1
+
+case "$server" in *[!0-9.]*) is_domain=1 ;; *) is_domain= ;; esac
+
+ips=$server
+if [ -n "$is_domain" ]; then
+	ips=$($SB resolve "$server" 2>/dev/null | sort -u)
+	[ -n "$ips" ] || { log "cannot resolve $server over DoH yet"; exit 1; }
+fi
+ip=$(echo "$ips" | head -n1)
+
+# mode: keep (link decides), pin <key>, insecure, or plain (sni == server: normal verification)
+mode=keep pin=
+if [ -n "$tls" ] && [ -z "$link_insecure" ] && [ -n "$sni" ] && [ "$sni" != "$server" ]; then
+	[ -n "$is_domain" ] && pin=$($SB pin "$server" "$port" "$sni" "$ip" 2>/dev/null)
+	if [ "${#pin}" -eq 44 ]; then
+		mode=pin
+	else
+		pin=$(echo "$ob" | jq -r '.tls.certificate_public_key_sha256[0] // empty')
+		if [ -n "$pin" ]; then
+			mode=pin
+			log "could not verify certificate of $server; keeping existing pin"
+		else
+			mode=insecure
+			log "$server cannot be verified by its own name; using allowInsecure for SNI $sni"
+		fi
+	fi
+elif [ -n "$tls" ] && [ -z "$link_insecure" ]; then
+	mode=plain
+fi
+
+excl=$(printf '%s\n' 192.168.0.0/16 $(printf '%s/32\n' $ips) | jq -R . | jq -sc .)
+new=$(jq --arg mode "$mode" --arg pin "$pin" --arg ip "$ip" --argjson excl "$excl" '
+	(.inbounds[] | select(.type == "tun")).route_exclude_address = $excl
+	| (.outbounds[] | select(.type == "vless")).server = $ip
+	| (.outbounds[] | select(.type == "vless") | .tls) |= (
+		if . == null or $mode == "keep" then .
+		elif $mode == "pin" then del(.insecure) | .certificate_public_key_sha256 = [$pin]
+		elif $mode == "insecure" then del(.certificate_public_key_sha256) | .insecure = true
+		else del(.certificate_public_key_sha256) | del(.insecure) end)' "$CONF") || exit 1
+
+if [ "$new" != "$(cat "$CONF")" ]; then
+	echo "$new" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+	log "updated: mode=$mode sni=$sni server=$ip pin=${pin:-none}"
+	echo changed
+	[ "$1" = "--restart" ] && pidof sing-box >/dev/null && /etc/init.d/sing-box restart
+fi
+exit 0

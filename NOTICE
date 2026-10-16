@@ -1,0 +1,18 @@
+ex6150v2-vless-ap
+Copyright (C) 2026 Monster-ZeroX and contributors. Licensed under GPL-3.0 (see LICENSE).
+
+Firmware images built by this project contain:
+
+- OpenWrt (https://openwrt.org): GPL-2.0 and other licenses; see the image manifest and
+  https://github.com/openwrt/openwrt for sources.
+- sing-box (https://github.com/SagerNet/sing-box), copyright nekohasekai: GPL-3.0-or-later.
+  The binary is a modified build: trimmed component registry, a minimal command line
+  (run/check/version/pin/resolve), and patched sing / sing-tun modules (singbox/patches/).
+  Its license adds: "no derivative work may use the name or imply association with this
+  application without prior consent." This project is NOT affiliated with or endorsed by
+  SagerNet / sing-box. "sing-box" is used here only to say which upstream software is included.
+- Go standard library and golang.org/x/crypto (https://go.dev): BSD-3-Clause.
+  singbox/overlay/ contains modified x/crypto files (ARM assembly ChaCha20 and 26-bit-limb
+  Poly1305), still BSD-3-Clause, copyright The Go Authors and contributors.
+
+Netgear and EX6150 are trademarks of NETGEAR, Inc. This project is not affiliated with NETGEAR.

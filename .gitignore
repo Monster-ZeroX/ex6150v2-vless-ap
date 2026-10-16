@@ -1,0 +1,5 @@
+/singbox/.work/
+/dist/
+personal/secrets.env
+*.bin
+*.img

@@ -1,0 +1,13 @@
+--- a/redirect_route_linux.go
++++ b/redirect_route_linux.go
+@@ -170,7 +170,9 @@
+ 	for index := range routesToAdd {
+ 		route := &routesToAdd[index]
+ 		err = netlink.RouteAppend(route)
+-		if err != nil {
++		// ex6150v2 patch: an existing identical route is the desired state; on 32-bit ARM the
++		// route listing above can miss it, and treating EEXIST as fatal aborted startup.
++		if err != nil && !errors.Is(err, unix.EEXIST) {
+ 			return E.Cause(err, "append redirect route ", route)
+ 		}
+ 	}

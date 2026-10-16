@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  OPENWRT_VERSION: 25.12.5
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # the crypto overlay replaces files of this exact Go release's vendored x/crypto
+          go-version: '1.26.1'
+          cache: false
+
+      - name: Build sing-box (patched, ARM crypto overlay)
+        run: bash singbox/build.sh dist
+
+      - name: Verify ARM crypto under qemu
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user-static
+          qemu-arm-static dist/cryptobench verify
+
+      - name: Build OpenWrt image
+        run: |
+          sudo apt-get install -y -q build-essential libncurses-dev zlib1g-dev gawk gettext \
+            libssl-dev xsltproc rsync wget unzip python3 python3-setuptools zstd file
+          LUCI=1 bash image/build-image.sh "$OPENWRT_VERSION" router dist/sing-box out
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp out/*ex6150v2*-squashfs-factory.img out/*ex6150v2*-squashfs-sysupgrade.bin release/
+          (cd installer && zip -q -r ../release/installer.zip install-windows.bat install.ps1 install.sh)
+          (cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: release/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body: |
+            OpenWrt ${{ env.OPENWRT_VERSION }} for the Netgear EX6150v2 with the VLESS access point.
+
+            - **New install from Netgear firmware:** `…-factory.img`, or run the installer (`installer.zip`).
+            - **Upgrade:** `…-sysupgrade.bin`. Keep settings to keep your link, SNI, Wi-Fi and passwords.
+            - Verify downloads with `SHA256SUMS`. The ARM crypto passed `cryptobench verify` in CI.
+
+            See the [README](https://github.com/${{ github.repository }}#readme) and [docs](https://github.com/${{ github.repository }}/tree/main/docs).
